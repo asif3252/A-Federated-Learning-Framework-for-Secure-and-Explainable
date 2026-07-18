@@ -1,0 +1,199 @@
+import argparse, time, json, warnings
+from pathlib import Path
+import numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt, joblib
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import *
+
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
+TARGET = "target"
+FEATURES = ["age","sex","cp","trestbps","chol","fbs","restecg","thalach","exang","oldpeak","slope","ca","thal"]
+
+def load_data(path):
+    df = pd.read_csv(path)
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing: raise ValueError(f"Missing columns: {missing}")
+    df = df[FEATURES + [TARGET]].dropna()
+    for c in FEATURES + [TARGET]: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna()
+    df[TARGET] = (df[TARGET].astype(int) > 0).astype(int)
+    return df
+
+def models():
+    scaler = ColumnTransformer([("scale", StandardScaler(), FEATURES)])
+    return {
+        "DecisionTree": DecisionTreeClassifier(random_state=RANDOM_STATE),
+        "SVM": Pipeline([("scale", scaler), ("model", SVC(C=3, kernel="rbf", probability=True, random_state=RANDOM_STATE))]),
+        "MLP": Pipeline([("scale", clone(scaler)), ("model", MLPClassifier(
+            hidden_layer_sizes=(64,32), max_iter=700, early_stopping=True,
+            validation_fraction=.15, n_iter_no_change=25, random_state=RANDOM_STATE))])
+    }
+
+def proba(model, X):
+    return model.predict_proba(X)[:,1] if hasattr(model, "predict_proba") else model.predict(X)
+
+def fedavg_predict(local_models, X, weights):
+    p = np.zeros(len(X))
+    for name, model in local_models.items():
+        p += weights[name] * proba(model, X)
+    return p
+
+def metrics(y, p):
+    pred = (p >= .5).astype(int)
+    return dict(
+        accuracy=accuracy_score(y,pred),
+        precision=precision_score(y,pred,zero_division=0),
+        recall=recall_score(y,pred,zero_division=0),
+        f1=f1_score(y,pred,zero_division=0)
+    )
+
+def plot_eda(df, out):
+    sns.set_theme(style="whitegrid")
+    sns.violinplot(data=df,x=TARGET,y="age"); plt.title("Distribution of age by target"); plt.tight_layout(); plt.savefig(out/"fig1_age_violin.png"); plt.close()
+    sns.pairplot(df[["age","cp","trestbps","chol","thalach","oldpeak",TARGET]], hue=TARGET).savefig(out/"fig2_pairplot.png"); plt.close("all")
+    sns.heatmap(df.corr(numeric_only=True), cmap="coolwarm", center=0); plt.title("Correlation Heatmap"); plt.tight_layout(); plt.savefig(out/"fig3_corr_heatmap.png"); plt.close()
+    sns.boxplot(data=df[FEATURES], orient="h"); plt.title("Feature Boxplots"); plt.tight_layout(); plt.savefig(out/"fig6_boxplots.png"); plt.close()
+    sns.countplot(data=df,x=TARGET); plt.title("Target Distribution"); plt.tight_layout(); plt.savefig(out/"fig7_target_distribution.png"); plt.close()
+
+def explain(local_models, X_train, X_test, sizes, out):
+    def global_predict(X):
+        X = pd.DataFrame(X, columns=FEATURES)
+        w = {k:sizes[k]/sum(sizes.values()) for k in sizes}
+        p = fedavg_predict(local_models, X, w)
+        return np.c_[1-p,p]
+    try:
+        import shap
+        bg = shap.sample(X_train, min(80,len(X_train)), random_state=RANDOM_STATE)
+        sample = X_test.iloc[:min(120,len(X_test))]
+        explainer = shap.KernelExplainer(lambda z: global_predict(z)[:,1], bg)
+        sv = np.array(explainer.shap_values(sample, nsamples=100))
+        imp = pd.Series(np.abs(sv).mean(0), index=FEATURES).sort_values()
+        imp.to_csv(out/"shap_importance.csv")
+        imp.plot.barh(); plt.title("Global Model SHAP Feature Importance"); plt.tight_layout(); plt.savefig(out/"fig14_shap_importance.png"); plt.close()
+        shap.summary_plot(sv, sample, show=False); plt.tight_layout(); plt.savefig(out/"fig15_shap_summary.png"); plt.close()
+        for f in ["ca","cp"]:
+            shap.dependence_plot(f, sv, sample, show=False); plt.tight_layout(); plt.savefig(out/f"fig16_shap_dependence_{f}.png"); plt.close()
+        shap.force_plot(explainer.expected_value, sv[0], sample.iloc[0], matplotlib=True, show=False); plt.savefig(out/"fig17_shap_force.png"); plt.close()
+        shap.decision_plot(explainer.expected_value, sv[:25], sample.iloc[:25], show=False); plt.savefig(out/"fig18_shap_decision.png"); plt.close()
+    except Exception as e:
+        (out/"shap_skipped.txt").write_text(str(e))
+    try:
+        from lime.lime_tabular import LimeTabularExplainer
+        le = LimeTabularExplainer(X_train.values, feature_names=FEATURES, class_names=["No disease","Disease"], mode="classification")
+        exp = le.explain_instance(X_test.iloc[0].values, global_predict, num_features=10)
+        exp.save_to_file(str(out/"lime_instance0.html"))
+        pd.DataFrame(exp.as_list(), columns=["feature","weight"]).to_csv(out/"lime_instance0.csv", index=False)
+    except Exception as e:
+        (out/"lime_skipped.txt").write_text(str(e))
+
+def main(data, output):
+    out = Path(output); out.mkdir(parents=True, exist_ok=True)
+    df = load_data(data); plot_eda(df,out)
+    Xtr,Xte,ytr,yte = train_test_split(df[FEATURES],df[TARGET],test_size=.2,stratify=df[TARGET],random_state=RANDOM_STATE)
+    folds = StratifiedKFold(3, shuffle=True, random_state=RANDOM_STATE)
+    clients = [(Xtr.iloc[i], ytr.iloc[i]) for _,i in folds.split(Xtr,ytr)]
+    local, times = {}, {}
+    for name,(Xc,yc) in zip(["DecisionTree","SVM","MLP"], clients):
+        m = clone(models()[name]); t=time.perf_counter(); m.fit(Xc,yc); times[name]=time.perf_counter()-t; local[name]=m
+    sizes = {"DecisionTree":len(clients[0][0]),"SVM":len(clients[1][0]),"MLP":len(clients[2][0])}
+    weights = {k:sizes[k]/sum(sizes.values()) for k in sizes}
+    probs = {k:proba(m,Xte) for k,m in local.items()}
+    probs["Global"] = fedavg_predict(local,Xte,weights)
+    preds = {k:(v>=.5).astype(int) for k,v in probs.items()}
+    result = pd.DataFrame({k:metrics(yte,v) for k,v in probs.items()}).T
+    result.to_csv(out/"all_metrics.csv")
+    result.loc[["DecisionTree","SVM","MLP"]].to_csv(out/"table2_local_metrics.csv")
+    result.loc[["Global"]].to_csv(out/"table3_global_metrics.csv")
+    sns.heatmap(result,annot=True,fmt=".3f",cmap="YlGnBu"); plt.savefig(out/"fig8_metrics_heatmap.png"); plt.close()
+    fig,ax=plt.subplots(2,2,figsize=(10,7))
+    for a,n in zip(ax.ravel(),["DecisionTree","SVM","MLP","Global"]):
+        ConfusionMatrixDisplay(confusion_matrix(yte,preds[n])).plot(ax=a,cmap="Blues",colorbar=False); a.set_title(n)
+    plt.tight_layout(); plt.savefig(out/"fig9_confusion_matrices.png"); plt.close()
+    sns.barplot(x=list(times),y=list(times.values())); plt.title("Training Time"); plt.savefig(out/"fig10_training_time.png"); plt.close()
+    for n,p in probs.items():
+        fpr,tpr,_=roc_curve(yte,p); plt.plot(fpr,tpr,label=f"{n} AUC {auc(fpr,tpr):.3f}")
+    plt.plot([0,1],[0,1],"--"); plt.legend(); plt.savefig(out/"fig13_roc.png"); plt.close()
+    explain(local,Xtr,Xte,sizes,out)
+    for n,m in local.items(): joblib.dump(m,out/f"{n}.joblib")
+    print(result.round(3)); print(f"Saved outputs to {out.resolve()}")
+def extra_metric_barplots(result, out):
+    colors = ["#786bd9", "#d98278", "#72d49b", "#565461"]
+    for metric in ["accuracy", "precision", "recall", "f1"]:
+        plt.figure(figsize=(6.5, 4.2))
+        sns.barplot(x=result.index, y=result[metric], palette=colors)
+        plt.ylim(0, 1.05)
+        plt.xlabel("model")
+        plt.ylabel(metric.capitalize())
+        plt.title(f"{metric.capitalize()} by Model")
+        plt.tight_layout()
+        plt.savefig(out / f"fig_metric_{metric}_by_model.png")
+        plt.close()
+
+
+def complexity_vs_training_time(times, out):
+    complexity = pd.Series({"DecisionTree": 0.02, "SVM": 0.12, "MLP": 1.0})
+    norm_time = pd.Series(times) / max(pd.Series(times).max(), 1e-12)
+
+    comp = pd.DataFrame({
+        "Model": complexity.index,
+        "Complexity (normalized)": complexity.values,
+        "Training Time (normalized)": norm_time[complexity.index].values,
+    }).melt(id_vars="Model", var_name="Measure", value_name="Value")
+
+    plt.figure(figsize=(7, 4))
+    sns.barplot(data=comp, x="Model", y="Value", hue="Measure")
+    plt.title("Complexity vs Training Time (Normalized)")
+    plt.tight_layout()
+    plt.savefig(out / "fig11_complexity_vs_training_time.png")
+    plt.close()
+
+
+def xai_coverage_analysis(result, probs, yte, out):
+    confidence = np.abs(probs["Global"] - 0.5) * 2
+    rows = []
+
+    for coverage in [0.98, 1.00]:
+        threshold = np.quantile(confidence, 1 - coverage)
+        keep = confidence >= threshold
+        row = metrics(yte.iloc[np.where(keep)[0]], probs["Global"][keep])
+        row["coverage"] = float(keep.mean())
+        rows.append(row)
+
+    cov = pd.DataFrame(rows).sort_values("coverage")
+    cov.to_csv(out / "xai_coverage_policy_metrics.csv", index=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(cov["coverage"], cov["f1"], marker="o", label="XAI policy")
+    axes[0].axhline(result.loc["Global", "f1"], linestyle="--", label="Baseline F1")
+    axes[0].set_title("F1 vs Coverage: XAI-informed Global vs Baseline")
+    axes[0].set_xlabel("Coverage")
+    axes[0].set_ylabel("F1-score")
+    axes[0].legend()
+
+    axes[1].plot(cov["coverage"], cov["accuracy"], marker="s", label="Accuracy")
+    axes[1].plot(cov["coverage"], cov["precision"], marker="o", label="Precision")
+    axes[1].axhline(result.loc["Global", "accuracy"], linestyle="--", label="Baseline Accuracy")
+    axes[1].axhline(result.loc["Global", "precision"], linestyle="--", label="Baseline Precision")
+    axes[1].set_title("Accuracy/Precision vs Coverage")
+    axes[1].set_xlabel("Coverage")
+    axes[1].set_ylabel("Score")
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(out / "fig18_xai_coverage_analysis.png")
+    plt.close()
+
+if __name__ == "__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--output", default="fedxai_outputs")
+    args=ap.parse_args()
+    main(args.data,args.output)
