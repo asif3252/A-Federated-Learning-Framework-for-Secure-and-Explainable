@@ -1,199 +1,1553 @@
-import argparse, time, json, warnings
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import time
+import warnings
+from dataclasses import asdict
+from dataclasses import dataclass
 from pathlib import Path
-import numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt, joblib
+from typing import Callable
+from typing import Dict
+from typing import List
+from typing import Mapping
+from typing import Optional
+from typing import Sequence
+from typing import Tuple
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.base import BaseEstimator
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.svm import SVC
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import auc
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import f1_score
+from sklearn.metrics import precision_score
+from sklearn.metrics import recall_score
+from sklearn.metrics import roc_curve
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
-from sklearn.metrics import *
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+
 
 warnings.filterwarnings("ignore")
+
+
+LOGGER = logging.getLogger("fedxai_health")
+
+
 RANDOM_STATE = 42
+
+
 TARGET = "target"
-FEATURES = ["age","sex","cp","trestbps","chol","fbs","restecg","thalach","exang","oldpeak","slope","ca","thal"]
 
-def load_data(path):
-    df = pd.read_csv(path)
-    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
-    if missing: raise ValueError(f"Missing columns: {missing}")
-    df = df[FEATURES + [TARGET]].dropna()
-    for c in FEATURES + [TARGET]: df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna()
-    df[TARGET] = (df[TARGET].astype(int) > 0).astype(int)
-    return df
 
-def models():
-    scaler = ColumnTransformer([("scale", StandardScaler(), FEATURES)])
-    return {
-        "DecisionTree": DecisionTreeClassifier(random_state=RANDOM_STATE),
-        "SVM": Pipeline([("scale", scaler), ("model", SVC(C=3, kernel="rbf", probability=True, random_state=RANDOM_STATE))]),
-        "MLP": Pipeline([("scale", clone(scaler)), ("model", MLPClassifier(
-            hidden_layer_sizes=(64,32), max_iter=700, early_stopping=True,
-            validation_fraction=.15, n_iter_no_change=25, random_state=RANDOM_STATE))])
-    }
+FEATURES = [
+    "age",
+    "sex",
+    "cp",
+    "trestbps",
+    "chol",
+    "fbs",
+    "restecg",
+    "thalach",
+    "exang",
+    "oldpeak",
+    "slope",
+    "ca",
+    "thal",
+]
 
-def proba(model, X):
-    return model.predict_proba(X)[:,1] if hasattr(model, "predict_proba") else model.predict(X)
 
-def fedavg_predict(local_models, X, weights):
-    p = np.zeros(len(X))
-    for name, model in local_models.items():
-        p += weights[name] * proba(model, X)
-    return p
+CLIENT_ORDER = [
+    "DecisionTree",
+    "SVM",
+    "MLP",
+]
 
-def metrics(y, p):
-    pred = (p >= .5).astype(int)
-    return dict(
-        accuracy=accuracy_score(y,pred),
-        precision=precision_score(y,pred,zero_division=0),
-        recall=recall_score(y,pred,zero_division=0),
-        f1=f1_score(y,pred,zero_division=0)
+
+ALL_MODEL_ORDER = [
+    "DecisionTree",
+    "SVM",
+    "MLP",
+    "Global",
+]
+
+
+PALETTE = {
+    "DecisionTree": "#786bd9",
+    "SVM": "#d98278",
+    "MLP": "#72d49b",
+    "Global": "#565461",
+    "NoDisease": "#786bd9",
+    "Disease": "#d38a83",
+    "Neutral": "#d7cc8f",
+    "Secondary": "#8f8589",
+    "Blue": "#1688e5",
+}
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    random_state: int = RANDOM_STATE
+    test_size: float = 0.20
+    n_clients: int = 3
+    decision_threshold: float = 0.50
+    shap_background_size: int = 80
+    shap_sample_size: int = 120
+    shap_nsamples: int = 100
+    lime_num_features: int = 10
+    xai_coverages: Tuple[float, ...] = (0.98, 1.00)
+    run_shap: bool = True
+    run_lime: bool = True
+    save_models: bool = True
+
+
+@dataclass
+class ClientTrainingResult:
+    name: str
+    model: BaseEstimator
+    train_seconds: float
+    n_train_samples: int
+
+
+@dataclass
+class EvaluationBundle:
+    metrics: pd.DataFrame
+    probabilities: Dict[str, np.ndarray]
+    predictions: Dict[str, np.ndarray]
+    confusion_matrices: Dict[str, np.ndarray]
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
     )
 
-def plot_eda(df, out):
-    sns.set_theme(style="whitegrid")
-    sns.violinplot(data=df,x=TARGET,y="age"); plt.title("Distribution of age by target"); plt.tight_layout(); plt.savefig(out/"fig1_age_violin.png"); plt.close()
-    sns.pairplot(df[["age","cp","trestbps","chol","thalach","oldpeak",TARGET]], hue=TARGET).savefig(out/"fig2_pairplot.png"); plt.close("all")
-    sns.heatmap(df.corr(numeric_only=True), cmap="coolwarm", center=0); plt.title("Correlation Heatmap"); plt.tight_layout(); plt.savefig(out/"fig3_corr_heatmap.png"); plt.close()
-    sns.boxplot(data=df[FEATURES], orient="h"); plt.title("Feature Boxplots"); plt.tight_layout(); plt.savefig(out/"fig6_boxplots.png"); plt.close()
-    sns.countplot(data=df,x=TARGET); plt.title("Target Distribution"); plt.tight_layout(); plt.savefig(out/"fig7_target_distribution.png"); plt.close()
 
-def explain(local_models, X_train, X_test, sizes, out):
-    def global_predict(X):
-        X = pd.DataFrame(X, columns=FEATURES)
-        w = {k:sizes[k]/sum(sizes.values()) for k in sizes}
-        p = fedavg_predict(local_models, X, w)
-        return np.c_[1-p,p]
-    try:
-        import shap
-        bg = shap.sample(X_train, min(80,len(X_train)), random_state=RANDOM_STATE)
-        sample = X_test.iloc[:min(120,len(X_test))]
-        explainer = shap.KernelExplainer(lambda z: global_predict(z)[:,1], bg)
-        sv = np.array(explainer.shap_values(sample, nsamples=100))
-        imp = pd.Series(np.abs(sv).mean(0), index=FEATURES).sort_values()
-        imp.to_csv(out/"shap_importance.csv")
-        imp.plot.barh(); plt.title("Global Model SHAP Feature Importance"); plt.tight_layout(); plt.savefig(out/"fig14_shap_importance.png"); plt.close()
-        shap.summary_plot(sv, sample, show=False); plt.tight_layout(); plt.savefig(out/"fig15_shap_summary.png"); plt.close()
-        for f in ["ca","cp"]:
-            shap.dependence_plot(f, sv, sample, show=False); plt.tight_layout(); plt.savefig(out/f"fig16_shap_dependence_{f}.png"); plt.close()
-        shap.force_plot(explainer.expected_value, sv[0], sample.iloc[0], matplotlib=True, show=False); plt.savefig(out/"fig17_shap_force.png"); plt.close()
-        shap.decision_plot(explainer.expected_value, sv[:25], sample.iloc[:25], show=False); plt.savefig(out/"fig18_shap_decision.png"); plt.close()
-    except Exception as e:
-        (out/"shap_skipped.txt").write_text(str(e))
-    try:
-        from lime.lime_tabular import LimeTabularExplainer
-        le = LimeTabularExplainer(X_train.values, feature_names=FEATURES, class_names=["No disease","Disease"], mode="classification")
-        exp = le.explain_instance(X_test.iloc[0].values, global_predict, num_features=10)
-        exp.save_to_file(str(out/"lime_instance0.html"))
-        pd.DataFrame(exp.as_list(), columns=["feature","weight"]).to_csv(out/"lime_instance0.csv", index=False)
-    except Exception as e:
-        (out/"lime_skipped.txt").write_text(str(e))
-
-def main(data, output):
-    out = Path(output); out.mkdir(parents=True, exist_ok=True)
-    df = load_data(data); plot_eda(df,out)
-    Xtr,Xte,ytr,yte = train_test_split(df[FEATURES],df[TARGET],test_size=.2,stratify=df[TARGET],random_state=RANDOM_STATE)
-    folds = StratifiedKFold(3, shuffle=True, random_state=RANDOM_STATE)
-    clients = [(Xtr.iloc[i], ytr.iloc[i]) for _,i in folds.split(Xtr,ytr)]
-    local, times = {}, {}
-    for name,(Xc,yc) in zip(["DecisionTree","SVM","MLP"], clients):
-        m = clone(models()[name]); t=time.perf_counter(); m.fit(Xc,yc); times[name]=time.perf_counter()-t; local[name]=m
-    sizes = {"DecisionTree":len(clients[0][0]),"SVM":len(clients[1][0]),"MLP":len(clients[2][0])}
-    weights = {k:sizes[k]/sum(sizes.values()) for k in sizes}
-    probs = {k:proba(m,Xte) for k,m in local.items()}
-    probs["Global"] = fedavg_predict(local,Xte,weights)
-    preds = {k:(v>=.5).astype(int) for k,v in probs.items()}
-    result = pd.DataFrame({k:metrics(yte,v) for k,v in probs.items()}).T
-    result.to_csv(out/"all_metrics.csv")
-    result.loc[["DecisionTree","SVM","MLP"]].to_csv(out/"table2_local_metrics.csv")
-    result.loc[["Global"]].to_csv(out/"table3_global_metrics.csv")
-    sns.heatmap(result,annot=True,fmt=".3f",cmap="YlGnBu"); plt.savefig(out/"fig8_metrics_heatmap.png"); plt.close()
-    fig,ax=plt.subplots(2,2,figsize=(10,7))
-    for a,n in zip(ax.ravel(),["DecisionTree","SVM","MLP","Global"]):
-        ConfusionMatrixDisplay(confusion_matrix(yte,preds[n])).plot(ax=a,cmap="Blues",colorbar=False); a.set_title(n)
-    plt.tight_layout(); plt.savefig(out/"fig9_confusion_matrices.png"); plt.close()
-    sns.barplot(x=list(times),y=list(times.values())); plt.title("Training Time"); plt.savefig(out/"fig10_training_time.png"); plt.close()
-    for n,p in probs.items():
-        fpr,tpr,_=roc_curve(yte,p); plt.plot(fpr,tpr,label=f"{n} AUC {auc(fpr,tpr):.3f}")
-    plt.plot([0,1],[0,1],"--"); plt.legend(); plt.savefig(out/"fig13_roc.png"); plt.close()
-    explain(local,Xtr,Xte,sizes,out)
-    for n,m in local.items(): joblib.dump(m,out/f"{n}.joblib")
-    print(result.round(3)); print(f"Saved outputs to {out.resolve()}")
-def extra_metric_barplots(result, out):
-    colors = ["#786bd9", "#d98278", "#72d49b", "#565461"]
-    for metric in ["accuracy", "precision", "recall", "f1"]:
-        plt.figure(figsize=(6.5, 4.2))
-        sns.barplot(x=result.index, y=result[metric], palette=colors)
-        plt.ylim(0, 1.05)
-        plt.xlabel("model")
-        plt.ylabel(metric.capitalize())
-        plt.title(f"{metric.capitalize()} by Model")
-        plt.tight_layout()
-        plt.savefig(out / f"fig_metric_{metric}_by_model.png")
-        plt.close()
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def complexity_vs_training_time(times, out):
-    complexity = pd.Series({"DecisionTree": 0.02, "SVM": 0.12, "MLP": 1.0})
-    norm_time = pd.Series(times) / max(pd.Series(times).max(), 1e-12)
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
 
-    comp = pd.DataFrame({
-        "Model": complexity.index,
-        "Complexity (normalized)": complexity.values,
-        "Training Time (normalized)": norm_time[complexity.index].values,
-    }).melt(id_vars="Model", var_name="Measure", value_name="Value")
 
-    plt.figure(figsize=(7, 4))
-    sns.barplot(data=comp, x="Model", y="Value", hue="Measure")
-    plt.title("Complexity vs Training Time (Normalized)")
+def write_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def set_plot_style() -> None:
+    sns.set_theme(style="whitegrid", context="notebook")
+    plt.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "savefig.dpi": 300,
+            "font.family": "serif",
+            "axes.titleweight": "bold",
+            "axes.labelsize": 10,
+            "axes.titlesize": 12,
+            "legend.fontsize": 9,
+        }
+    )
+
+
+def validate_required_columns(df: pd.DataFrame) -> None:
+    required = FEATURES + [TARGET]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+
+def coerce_numeric_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    clean = df.copy()
+    for column in columns:
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    return clean
+
+
+def normalize_binary_target(series: pd.Series) -> pd.Series:
+    return (series.astype(int) > 0).astype(int)
+
+
+def load_heart_data(data_path: Path) -> pd.DataFrame:
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {data_path}. "
+            "Download heart.csv from Kaggle: "
+            "https://www.kaggle.com/datasets/johnsmith88/heart-disease-dataset"
+        )
+
+    df = pd.read_csv(data_path)
+    validate_required_columns(df)
+
+    df = df[FEATURES + [TARGET]].copy()
+    df = coerce_numeric_columns(df, FEATURES + [TARGET])
+    df = df.dropna()
+    df[TARGET] = normalize_binary_target(df[TARGET])
+
+    return df
+
+
+def save_dataset_profile(df: pd.DataFrame, output_dir: Path) -> None:
+    profile_dir = ensure_dir(output_dir / "dataset_profile")
+    df.describe().T.to_csv(profile_dir / "descriptive_statistics.csv")
+    df[TARGET].value_counts().sort_index().to_csv(
+        profile_dir / "target_counts.csv",
+        header=["count"],
+    )
+    df.dtypes.astype(str).to_csv(
+        profile_dir / "column_dtypes.csv",
+        header=["dtype"],
+    )
+
+
+def split_train_test(
+    df: pd.DataFrame,
+    config: ExperimentConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    return train_test_split(
+        df[FEATURES],
+        df[TARGET],
+        test_size=config.test_size,
+        stratify=df[TARGET],
+        random_state=config.random_state,
+    )
+
+
+def create_federated_clients(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    config: ExperimentConfig,
+) -> List[Tuple[pd.DataFrame, pd.Series]]:
+    splitter = StratifiedKFold(
+        n_splits=config.n_clients,
+        shuffle=True,
+        random_state=config.random_state,
+    )
+
+    clients = []
+
+    for _, client_index in splitter.split(x_train, y_train):
+        clients.append(
+            (
+                x_train.iloc[client_index].copy(),
+                y_train.iloc[client_index].copy(),
+            )
+        )
+
+    return clients
+
+
+def save_client_profiles(
+    clients: Sequence[Tuple[pd.DataFrame, pd.Series]],
+    output_dir: Path,
+) -> None:
+    rows = []
+
+    for name, (_, y_client) in zip(CLIENT_ORDER, clients):
+        counts = y_client.value_counts().sort_index()
+
+        rows.append(
+            {
+                "client": name,
+                "n_samples": int(len(y_client)),
+                "target_0": int(counts.get(0, 0)),
+                "target_1": int(counts.get(1, 0)),
+                "positive_rate": float(y_client.mean()),
+            }
+        )
+
+    pd.DataFrame(rows).to_csv(
+        output_dir / "client_partition_profile.csv",
+        index=False,
+    )
+
+
+def build_preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        transformers=[
+            ("standard", StandardScaler(), FEATURES),
+        ],
+        remainder="drop",
+    )
+
+
+def build_model_templates(config: ExperimentConfig) -> Dict[str, BaseEstimator]:
+    svm_scaler = build_preprocessor()
+    mlp_scaler = build_preprocessor()
+
+    decision_tree = DecisionTreeClassifier(
+        criterion="gini",
+        max_depth=None,
+        min_samples_split=2,
+        random_state=config.random_state,
+    )
+
+    svm = Pipeline(
+        steps=[
+            ("scale", svm_scaler),
+            (
+                "model",
+                SVC(
+                    kernel="rbf",
+                    C=3.0,
+                    gamma="scale",
+                    probability=True,
+                    random_state=config.random_state,
+                ),
+            ),
+        ]
+    )
+
+    mlp = Pipeline(
+        steps=[
+            ("scale", mlp_scaler),
+            (
+                "model",
+                MLPClassifier(
+                    hidden_layer_sizes=(64, 32),
+                    activation="relu",
+                    solver="adam",
+                    alpha=0.0005,
+                    batch_size=32,
+                    learning_rate_init=0.001,
+                    max_iter=700,
+                    early_stopping=True,
+                    validation_fraction=0.15,
+                    n_iter_no_change=25,
+                    random_state=config.random_state,
+                ),
+            ),
+        ]
+    )
+
+    return {
+        "DecisionTree": decision_tree,
+        "SVM": svm,
+        "MLP": mlp,
+    }
+def train_clients(
+    clients: Sequence[Tuple[pd.DataFrame, pd.Series]],
+    config: ExperimentConfig,
+) -> Dict[str, ClientTrainingResult]:
+    templates = build_model_templates(config)
+    results = {}
+
+    for name, (x_client, y_client) in zip(CLIENT_ORDER, clients):
+        LOGGER.info("Training client model: %s", name)
+
+        model = clone(templates[name])
+        start = time.perf_counter()
+        model.fit(x_client, y_client)
+        elapsed = time.perf_counter() - start
+
+        results[name] = ClientTrainingResult(
+            name=name,
+            model=model,
+            train_seconds=float(elapsed),
+            n_train_samples=int(len(x_client)),
+        )
+
+        LOGGER.info("Finished %s in %.6f seconds", name, elapsed)
+
+    return results
+
+
+def model_positive_probability(
+    model: BaseEstimator,
+    x: pd.DataFrame,
+) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(x)[:, 1]
+
+    if hasattr(model, "decision_function"):
+        raw_scores = model.decision_function(x)
+        return 1.0 / (1.0 + np.exp(-raw_scores))
+
+    return model.predict(x).astype(float)
+
+
+def sample_size_weights(
+    training_results: Mapping[str, ClientTrainingResult],
+) -> Dict[str, float]:
+    total = sum(result.n_train_samples for result in training_results.values())
+
+    return {
+        name: result.n_train_samples / total
+        for name, result in training_results.items()
+    }
+
+
+def fedavg_probability_aggregation(
+    training_results: Mapping[str, ClientTrainingResult],
+    x: pd.DataFrame,
+    weights: Optional[Mapping[str, float]] = None,
+) -> np.ndarray:
+    """
+    Heterogeneous FedAvg-style probability aggregation.
+
+    Standard FedAvg averages model parameters. That only works when clients
+    share the same architecture. This study intentionally uses three different
+    algorithms, so parameter averaging is not valid.
+
+    Instead, each hospital/client keeps its data local and sends only
+    probability outputs. The server aggregates those outputs using sample-size
+    weights. This provides a practical heterogeneous federated ensemble.
+    """
+
+    if weights is None:
+        weights = sample_size_weights(training_results)
+
+    global_probability = np.zeros(len(x), dtype=float)
+
+    for name, result in training_results.items():
+        local_probability = model_positive_probability(result.model, x)
+        global_probability += weights[name] * local_probability
+
+    return global_probability
+
+
+def threshold_probabilities(
+    probabilities: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    return (probabilities >= threshold).astype(int)
+
+
+def compute_metric_dict(
+    y_true: pd.Series,
+    probabilities: np.ndarray,
+    threshold: float,
+) -> Dict[str, float]:
+    predictions = threshold_probabilities(probabilities, threshold)
+
+    return {
+        "accuracy": float(accuracy_score(y_true, predictions)),
+        "precision": float(precision_score(y_true, predictions, zero_division=0)),
+        "recall": float(recall_score(y_true, predictions, zero_division=0)),
+        "f1": float(f1_score(y_true, predictions, zero_division=0)),
+    }
+
+
+def evaluate_all_models(
+    training_results: Mapping[str, ClientTrainingResult],
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    config: ExperimentConfig,
+) -> EvaluationBundle:
+    probabilities = {}
+    predictions = {}
+    metrics = {}
+    matrices = {}
+
+    for name in CLIENT_ORDER:
+        result = training_results[name]
+
+        probabilities[name] = model_positive_probability(result.model, x_test)
+        predictions[name] = threshold_probabilities(
+            probabilities[name],
+            config.decision_threshold,
+        )
+        metrics[name] = compute_metric_dict(
+            y_test,
+            probabilities[name],
+            config.decision_threshold,
+        )
+        matrices[name] = confusion_matrix(y_test, predictions[name])
+
+    probabilities["Global"] = fedavg_probability_aggregation(
+        training_results,
+        x_test,
+    )
+    predictions["Global"] = threshold_probabilities(
+        probabilities["Global"],
+        config.decision_threshold,
+    )
+    metrics["Global"] = compute_metric_dict(
+        y_test,
+        probabilities["Global"],
+        config.decision_threshold,
+    )
+    matrices["Global"] = confusion_matrix(y_test, predictions["Global"])
+
+    metrics_df = pd.DataFrame(metrics).T.loc[ALL_MODEL_ORDER]
+
+    return EvaluationBundle(
+        metrics=metrics_df,
+        probabilities=probabilities,
+        predictions=predictions,
+        confusion_matrices=matrices,
+    )
+
+
+def save_metric_tables(
+    bundle: EvaluationBundle,
+    output_dir: Path,
+) -> None:
+    tables_dir = ensure_dir(output_dir / "tables")
+
+    bundle.metrics.to_csv(tables_dir / "table_all_model_metrics.csv")
+
+    bundle.metrics.loc[CLIENT_ORDER].to_csv(
+        tables_dir / "table_2_local_model_metrics.csv"
+    )
+
+    bundle.metrics.loc[["Global"]].to_csv(
+        tables_dir / "table_3_global_ensemble_metrics.csv"
+    )
+
+    write_json(
+        tables_dir / "table_metrics.json",
+        {
+            "all_metrics": bundle.metrics.round(6).to_dict(orient="index"),
+            "table_2_local_model_metrics": bundle.metrics.loc[CLIENT_ORDER]
+            .round(3)
+            .to_dict(orient="index"),
+            "table_3_global_ensemble_metrics": bundle.metrics.loc[["Global"]]
+            .round(3)
+            .to_dict(orient="index"),
+        },
+    )
+
+
+def save_figure(path: Path) -> None:
     plt.tight_layout()
-    plt.savefig(out / "fig11_complexity_vs_training_time.png")
+    plt.savefig(path)
     plt.close()
 
 
-def xai_coverage_analysis(result, probs, yte, out):
-    confidence = np.abs(probs["Global"] - 0.5) * 2
+def plot_age_distribution(
+    df: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(7, 4.5))
+
+    sns.violinplot(
+        data=df,
+        x=TARGET,
+        y="age",
+        palette=[PALETTE["NoDisease"], PALETTE["Disease"]],
+        inner="quartile",
+    )
+
+    plt.title("Distribution of age by target")
+    save_figure(figures_dir / "figure_01_age_distribution_by_target.png")
+
+
+def plot_pair_relationships(
+    df: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
+    pair_columns = [
+        "age",
+        "cp",
+        "trestbps",
+        "chol",
+        "thalach",
+        "oldpeak",
+        TARGET,
+    ]
+
+    grid = sns.pairplot(
+        df[pair_columns],
+        hue=TARGET,
+        diag_kind="hist",
+        corner=False,
+        plot_kws={"s": 16, "alpha": 0.80},
+    )
+
+    grid.fig.suptitle("Pair Plot Feature Relationships", y=1.02)
+    grid.savefig(figures_dir / "figure_02_pair_plot_feature_relationships.png")
+    plt.close("all")
+
+
+def plot_correlation_heatmap(
+    df: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(8, 5.5))
+
+    sns.heatmap(
+        df.corr(numeric_only=True),
+        cmap="coolwarm",
+        center=0,
+        linewidths=0.25,
+    )
+
+    plt.title("Correlation Heatmap")
+    save_figure(figures_dir / "figure_03_correlation_heatmap.png")
+
+
+def plot_feature_boxplots(
+    df: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(8, 4.8))
+
+    sns.boxplot(
+        data=df[FEATURES],
+        orient="h",
+        color=PALETTE["Neutral"],
+        fliersize=3,
+    )
+
+    plt.title("Feature Boxplots (Outlier Overview)")
+    save_figure(figures_dir / "figure_06_feature_boxplots.png")
+
+
+def plot_target_distribution(
+    df: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(6, 4))
+
+    sns.countplot(
+        data=df,
+        x=TARGET,
+        palette=[PALETTE["NoDisease"], PALETTE["Disease"]],
+    )
+
+    plt.title("Target Distribution")
+    save_figure(figures_dir / "figure_07_target_distribution.png")
+
+
+def generate_eda_figures(
+    df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    LOGGER.info("Generating EDA figures")
+
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    plot_age_distribution(df, figures_dir)
+    plot_pair_relationships(df, figures_dir)
+    plot_correlation_heatmap(df, figures_dir)
+    plot_feature_boxplots(df, figures_dir)
+    plot_target_distribution(df, figures_dir)
+
+
+def plot_metrics_heatmap(
+    bundle: EvaluationBundle,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(7, 4.8))
+
+    sns.heatmap(
+        bundle.metrics,
+        annot=True,
+        fmt=".3f",
+        cmap="YlGnBu",
+        vmin=0.80,
+        vmax=1.00,
+    )
+
+    plt.title("Evaluation Metrics Heatmap")
+    save_figure(figures_dir / "figure_08_evaluation_metrics_heatmap.png")
+
+
+def plot_confusion_matrices(
+    bundle: EvaluationBundle,
+    figures_dir: Path,
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+
+    for ax, name in zip(axes.ravel(), ALL_MODEL_ORDER):
+        ConfusionMatrixDisplay(
+            bundle.confusion_matrices[name]
+        ).plot(
+            ax=ax,
+            cmap="Blues",
+            colorbar=False,
+        )
+
+        ax.set_title(f"{name} Confusion Matrix")
+
+    plt.tight_layout()
+    plt.savefig(figures_dir / "figure_09_confusion_matrices.png")
+    plt.close()
+
+
+def extract_training_times(
+    training_results: Mapping[str, ClientTrainingResult],
+) -> pd.Series:
+    return pd.Series(
+        {
+            name: training_results[name].train_seconds
+            for name in CLIENT_ORDER
+        },
+        name="seconds",
+    )
+
+
+def plot_training_time(
+    training_results: Mapping[str, ClientTrainingResult],
+    figures_dir: Path,
+) -> None:
+    times = extract_training_times(training_results)
+
+    plt.figure(figsize=(7, 4))
+
+    sns.barplot(
+        x=times.index,
+        y=times.values,
+        palette=[
+            PALETTE["DecisionTree"],
+            PALETTE["SVM"],
+            PALETTE["MLP"],
+        ],
+    )
+
+    plt.ylabel("Seconds")
+    plt.title("Training Time (seconds)")
+    save_figure(figures_dir / "figure_10_training_time_seconds.png")
+
+
+def plot_metric_bars(
+    bundle: EvaluationBundle,
+    figures_dir: Path,
+) -> None:
+    colors = [PALETTE[name] for name in ALL_MODEL_ORDER]
+
+    for metric_name in ["accuracy", "precision", "recall", "f1"]:
+        plt.figure(figsize=(6.5, 4.2))
+
+        sns.barplot(
+            x=bundle.metrics.index,
+            y=bundle.metrics[metric_name],
+            palette=colors,
+        )
+
+        plt.ylim(0, 1.05)
+        plt.xlabel("model")
+        plt.ylabel(metric_name.capitalize())
+        plt.title(f"{metric_name.capitalize()} by Model")
+
+        save_figure(figures_dir / f"figure_11_{metric_name}_by_model.png")
+
+
+def normalized_complexity_table(
+    training_results: Mapping[str, ClientTrainingResult],
+) -> pd.DataFrame:
+    complexity = pd.Series(
+        {
+            "DecisionTree": 0.02,
+            "SVM": 0.12,
+            "MLP": 1.00,
+        },
+        name="complexity_normalized",
+    )
+
+    times = extract_training_times(training_results)
+    normalized_times = times / max(times.max(), 1e-12)
+
+    return pd.DataFrame(
+        {
+            "model": CLIENT_ORDER,
+            "complexity_normalized": [
+                float(complexity[name]) for name in CLIENT_ORDER
+            ],
+            "training_time_normalized": [
+                float(normalized_times[name]) for name in CLIENT_ORDER
+            ],
+            "training_seconds": [
+                float(times[name]) for name in CLIENT_ORDER
+            ],
+        }
+    )
+
+
+def plot_complexity_vs_training_time(
+    training_results: Mapping[str, ClientTrainingResult],
+    output_dir: Path,
+) -> None:
+    figures_dir = ensure_dir(output_dir / "figures")
+    tables_dir = ensure_dir(output_dir / "tables")
+
+    table = normalized_complexity_table(training_results)
+    table.to_csv(tables_dir / "complexity_vs_training_time.csv", index=False)
+
+    plot_df = table.rename(
+        columns={
+            "model": "Model",
+            "complexity_normalized": "Complexity (normalized)",
+            "training_time_normalized": "Training Time (normalized)",
+        }
+    ).melt(
+        id_vars="Model",
+        value_vars=[
+            "Complexity (normalized)",
+            "Training Time (normalized)",
+        ],
+        var_name="Measure",
+        value_name="Value",
+    )
+
+    plt.figure(figsize=(7, 4))
+
+    sns.barplot(
+        data=plot_df,
+        x="Model",
+        y="Value",
+        hue="Measure",
+        palette=[PALETTE["Neutral"], PALETTE["Secondary"]],
+    )
+
+    plt.title("Complexity vs Training Time (Normalized)")
+    save_figure(figures_dir / "figure_12_complexity_vs_training_time.png")
+
+
+def plot_roc_curves(
+    bundle: EvaluationBundle,
+    y_test: pd.Series,
+    figures_dir: Path,
+) -> None:
+    plt.figure(figsize=(7, 5))
+
+    for name in ALL_MODEL_ORDER:
+        fpr, tpr, _ = roc_curve(y_test, bundle.probabilities[name])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, label=f"{name} AUC {roc_auc:.3f}")
+
+    plt.plot([0, 1], [0, 1], "--", color="lightgray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves")
+    plt.legend(loc="lower right")
+
+    save_figure(figures_dir / "figure_13_roc_curves.png")
+
+
+def generate_evaluation_figures(
+    bundle: EvaluationBundle,
+    training_results: Mapping[str, ClientTrainingResult],
+    y_test: pd.Series,
+    output_dir: Path,
+) -> None:
+    LOGGER.info("Generating evaluation figures")
+
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    plot_metrics_heatmap(bundle, figures_dir)
+    plot_confusion_matrices(bundle, figures_dir)
+    plot_training_time(training_results, figures_dir)
+    plot_metric_bars(bundle, figures_dir)
+    plot_complexity_vs_training_time(training_results, output_dir)
+    plot_roc_curves(bundle, y_test, figures_dir)
+def make_global_predict_proba(
+    training_results: Mapping[str, ClientTrainingResult],
+) -> Callable[[np.ndarray | pd.DataFrame], np.ndarray]:
+    def predict_proba(x: np.ndarray | pd.DataFrame) -> np.ndarray:
+        if not isinstance(x, pd.DataFrame):
+            x = pd.DataFrame(x, columns=FEATURES)
+
+        p1 = fedavg_probability_aggregation(training_results, x)
+
+        return np.column_stack([1.0 - p1, p1])
+
+    return predict_proba
+
+
+def save_shap_feature_importance(
+    shap_values: np.ndarray,
+    sample: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    figures_dir = ensure_dir(output_dir / "figures")
+    tables_dir = ensure_dir(output_dir / "tables")
+
+    mean_abs = pd.Series(
+        np.abs(shap_values).mean(axis=0),
+        index=sample.columns,
+        name="mean_abs_shap",
+    ).sort_values(ascending=False)
+
+    mean_abs.to_csv(tables_dir / "global_shap_feature_importance.csv")
+
+    plt.figure(figsize=(7, 5))
+
+    mean_abs.sort_values().plot(
+        kind="barh",
+        color=PALETTE["Blue"],
+    )
+
+    plt.xlabel("mean(|SHAP value|)")
+    plt.title("Global Model SHAP Feature Importance (Mean |SHAP|)")
+
+    save_figure(figures_dir / "figure_14_global_shap_feature_importance.png")
+
+
+def save_shap_summary_plot(
+    shap_values: np.ndarray,
+    sample: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    import shap
+
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    shap.summary_plot(
+        shap_values,
+        sample,
+        show=False,
+        plot_size=(7, 5),
+    )
+
+    plt.title("Global Model SHAP Summary (Beeswarm)")
+    plt.tight_layout()
+    plt.savefig(figures_dir / "figure_15_global_shap_summary.png")
+    plt.close()
+
+
+def save_shap_dependence_plots(
+    shap_values: np.ndarray,
+    sample: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    import shap
+
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    for feature in ["ca", "cp"]:
+        if feature not in sample.columns:
+            continue
+
+        shap.dependence_plot(
+            feature,
+            shap_values,
+            sample,
+            show=False,
+        )
+
+        plt.title(f"SHAP Dependence: {feature}")
+        plt.tight_layout()
+        plt.savefig(figures_dir / f"figure_16_shap_dependence_{feature}.png")
+        plt.close()
+
+
+def save_shap_force_plot(
+    expected_value: float,
+    shap_values: np.ndarray,
+    sample: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    import shap
+
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    shap.force_plot(
+        expected_value,
+        shap_values[0],
+        sample.iloc[0],
+        matplotlib=True,
+        show=False,
+    )
+
+    plt.title("SHAP Force Plot: Instance 0")
+    plt.tight_layout()
+    plt.savefig(figures_dir / "figure_17_shap_force_plot_instance_0.png")
+    plt.close()
+
+
+def save_shap_decision_plot(
+    expected_value: float,
+    shap_values: np.ndarray,
+    sample: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    import shap
+
+    figures_dir = ensure_dir(output_dir / "figures")
+    n_plot = min(25, len(sample))
+
+    shap.decision_plot(
+        expected_value,
+        shap_values[:n_plot],
+        sample.iloc[:n_plot],
+        show=False,
+    )
+
+    plt.title("SHAP Decision Plot (subset)")
+    plt.tight_layout()
+    plt.savefig(figures_dir / "figure_18_shap_decision_plot_subset.png")
+    plt.close()
+
+
+def generate_shap_outputs(
+    training_results: Mapping[str, ClientTrainingResult],
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    config: ExperimentConfig,
+    output_dir: Path,
+) -> None:
+    if not config.run_shap:
+        LOGGER.info("Skipping SHAP")
+        return
+
+    try:
+        import shap
+    except Exception as exc:
+        LOGGER.warning("SHAP unavailable: %s", exc)
+        write_text(output_dir / "shap_skipped.txt", f"SHAP unavailable: {exc}")
+        return
+
+    LOGGER.info("Generating SHAP explanations")
+
+    background = shap.sample(
+        x_train,
+        min(config.shap_background_size, len(x_train)),
+        random_state=config.random_state,
+    )
+
+    sample = x_test.iloc[: min(config.shap_sample_size, len(x_test))].copy()
+
+    predictor = make_global_predict_proba(training_results)
+
+    explainer = shap.KernelExplainer(
+        lambda z: predictor(z)[:, 1],
+        background,
+    )
+
+    raw_values = explainer.shap_values(
+        sample,
+        nsamples=config.shap_nsamples,
+    )
+
+    shap_values = np.asarray(raw_values)
+
+    save_shap_feature_importance(
+        shap_values,
+        sample,
+        output_dir,
+    )
+
+    save_shap_summary_plot(
+        shap_values,
+        sample,
+        output_dir,
+    )
+
+    save_shap_dependence_plots(
+        shap_values,
+        sample,
+        output_dir,
+    )
+
+    save_shap_force_plot(
+        explainer.expected_value,
+        shap_values,
+        sample,
+        output_dir,
+    )
+
+    save_shap_decision_plot(
+        explainer.expected_value,
+        shap_values,
+        sample,
+        output_dir,
+    )
+
+
+def generate_lime_outputs(
+    training_results: Mapping[str, ClientTrainingResult],
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    config: ExperimentConfig,
+    output_dir: Path,
+) -> None:
+    if not config.run_lime:
+        LOGGER.info("Skipping LIME")
+        return
+
+    try:
+        from lime.lime_tabular import LimeTabularExplainer
+    except Exception as exc:
+        LOGGER.warning("LIME unavailable: %s", exc)
+        write_text(output_dir / "lime_skipped.txt", f"LIME unavailable: {exc}")
+        return
+
+    LOGGER.info("Generating LIME explanation")
+
+    predictor = make_global_predict_proba(training_results)
+
+    explainer = LimeTabularExplainer(
+        training_data=x_train.values,
+        feature_names=FEATURES,
+        class_names=["No disease", "Disease"],
+        mode="classification",
+        discretize_continuous=True,
+        random_state=config.random_state,
+    )
+
+    explanation = explainer.explain_instance(
+        x_test.iloc[0].values,
+        predictor,
+        num_features=config.lime_num_features,
+    )
+
+    explain_dir = ensure_dir(output_dir / "explainability")
+
+    explanation.save_to_file(
+        str(explain_dir / "lime_instance_0_explanation.html")
+    )
+
+    pd.DataFrame(
+        explanation.as_list(),
+        columns=["feature_rule", "local_weight"],
+    ).to_csv(
+        explain_dir / "lime_instance_0_explanation.csv",
+        index=False,
+    )
+
+
+def evaluate_coverage_policy(
+    y_test: pd.Series,
+    probabilities: np.ndarray,
+    coverages: Sequence[float],
+    threshold: float,
+) -> pd.DataFrame:
+    confidence = np.abs(probabilities - 0.5) * 2.0
+
     rows = []
 
-    for coverage in [0.98, 1.00]:
-        threshold = np.quantile(confidence, 1 - coverage)
-        keep = confidence >= threshold
-        row = metrics(yte.iloc[np.where(keep)[0]], probs["Global"][keep])
-        row["coverage"] = float(keep.mean())
+    for requested_coverage in coverages:
+        quantile_value = 1.0 - requested_coverage
+        confidence_threshold = np.quantile(confidence, quantile_value)
+
+        keep_mask = confidence >= confidence_threshold
+        kept_index = np.where(keep_mask)[0]
+
+        kept_y = y_test.iloc[kept_index]
+        kept_probability = probabilities[keep_mask]
+
+        row = compute_metric_dict(
+            kept_y,
+            kept_probability,
+            threshold,
+        )
+
+        row["requested_coverage"] = float(requested_coverage)
+        row["actual_coverage"] = float(keep_mask.mean())
+        row["confidence_threshold"] = float(confidence_threshold)
+        row["n_decided"] = int(keep_mask.sum())
+        row["n_referred"] = int((~keep_mask).sum())
+
         rows.append(row)
 
-    cov = pd.DataFrame(rows).sort_values("coverage")
-    cov.to_csv(out / "xai_coverage_policy_metrics.csv", index=False)
+    return pd.DataFrame(rows).sort_values("actual_coverage")
+
+
+def plot_xai_coverage_analysis(
+    coverage_df: pd.DataFrame,
+    bundle: EvaluationBundle,
+    output_dir: Path,
+) -> None:
+    figures_dir = ensure_dir(output_dir / "figures")
+
+    baseline_f1 = bundle.metrics.loc["Global", "f1"]
+    baseline_accuracy = bundle.metrics.loc["Global", "accuracy"]
+    baseline_precision = bundle.metrics.loc["Global", "precision"]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    axes[0].plot(cov["coverage"], cov["f1"], marker="o", label="XAI policy")
-    axes[0].axhline(result.loc["Global", "f1"], linestyle="--", label="Baseline F1")
+    axes[0].plot(
+        coverage_df["actual_coverage"],
+        coverage_df["f1"],
+        marker="o",
+        color=PALETTE["DecisionTree"],
+        label="XAI policy (vary tau)",
+    )
+
+    axes[0].axhline(
+        baseline_f1,
+        linestyle="--",
+        color=PALETTE["SVM"],
+        label="Baseline F1 (Global)",
+    )
+
     axes[0].set_title("F1 vs Coverage: XAI-informed Global vs Baseline")
-    axes[0].set_xlabel("Coverage")
+    axes[0].set_xlabel("Coverage (fraction decided)")
     axes[0].set_ylabel("F1-score")
     axes[0].legend()
 
-    axes[1].plot(cov["coverage"], cov["accuracy"], marker="s", label="Accuracy")
-    axes[1].plot(cov["coverage"], cov["precision"], marker="o", label="Precision")
-    axes[1].axhline(result.loc["Global", "accuracy"], linestyle="--", label="Baseline Accuracy")
-    axes[1].axhline(result.loc["Global", "precision"], linestyle="--", label="Baseline Precision")
+    axes[1].plot(
+        coverage_df["actual_coverage"],
+        coverage_df["accuracy"],
+        marker="s",
+        color=PALETTE["MLP"],
+        label="Accuracy (XAI policy)",
+    )
+
+    axes[1].plot(
+        coverage_df["actual_coverage"],
+        coverage_df["precision"],
+        marker="o",
+        color=PALETTE["Global"],
+        label="Precision (XAI policy)",
+    )
+
+    axes[1].axhline(
+        baseline_accuracy,
+        linestyle="--",
+        color=PALETTE["MLP"],
+        alpha=0.75,
+        label="Baseline Accuracy",
+    )
+
+    axes[1].axhline(
+        baseline_precision,
+        linestyle="--",
+        color=PALETTE["Global"],
+        alpha=0.75,
+        label="Baseline Precision",
+    )
+
     axes[1].set_title("Accuracy/Precision vs Coverage")
-    axes[1].set_xlabel("Coverage")
+    axes[1].set_xlabel("Coverage (fraction decided)")
     axes[1].set_ylabel("Score")
     axes[1].legend()
 
     plt.tight_layout()
-    plt.savefig(out / "fig18_xai_coverage_analysis.png")
+    plt.savefig(figures_dir / "figure_19_xai_coverage_analysis.png")
     plt.close()
 
+
+def generate_xai_coverage_outputs(
+    bundle: EvaluationBundle,
+    y_test: pd.Series,
+    config: ExperimentConfig,
+    output_dir: Path,
+) -> None:
+    LOGGER.info("Generating XAI-informed coverage analysis")
+
+    tables_dir = ensure_dir(output_dir / "tables")
+
+    coverage_df = evaluate_coverage_policy(
+        y_test=y_test,
+        probabilities=bundle.probabilities["Global"],
+        coverages=config.xai_coverages,
+        threshold=config.decision_threshold,
+    )
+
+    coverage_df.to_csv(
+        tables_dir / "xai_coverage_policy_metrics.csv",
+        index=False,
+    )
+
+    plot_xai_coverage_analysis(
+        coverage_df,
+        bundle,
+        output_dir,
+    )
+
+
+def save_trained_models(
+    training_results: Mapping[str, ClientTrainingResult],
+    output_dir: Path,
+) -> None:
+    models_dir = ensure_dir(output_dir / "models")
+
+    for name, result in training_results.items():
+        joblib.dump(
+            result.model,
+            models_dir / f"{name}.joblib",
+        )
+
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    try:
+        return df.to_markdown()
+    except Exception:
+        return df.to_string()
+def make_results_summary(
+    df: pd.DataFrame,
+    training_results: Mapping[str, ClientTrainingResult],
+    bundle: EvaluationBundle,
+    config: ExperimentConfig,
+) -> str:
+    times = extract_training_times(training_results)
+    client_df = pd.DataFrame(
+        [
+            {
+                "client": name,
+                "n_train_samples": result.n_train_samples,
+                "training_seconds": result.train_seconds,
+            }
+            for name, result in training_results.items()
+        ]
+    )
+    table_2 = bundle.metrics.loc[CLIENT_ORDER].round(3)
+    table_3 = bundle.metrics.loc[["Global"]].round(3)
+
+    return f"""# FedXAI-Health Reproducible Results
+
+## Dataset
+
+- Rows after cleaning: {len(df)}
+- Features: {len(FEATURES)}
+- Target: `{TARGET}`
+
+## Configuration
+
+```json
+{json.dumps(asdict(config), indent=2)}
+```
+
+## Client training summary
+
+{dataframe_to_markdown(client_df.round(6))}
+
+## Local model metrics
+
+{dataframe_to_markdown(table_2)}
+
+## Global ensemble metrics
+
+{dataframe_to_markdown(table_3)}
+
+## Training times
+
+{dataframe_to_markdown(times.to_frame().round(6))}
+"""
+
+
+def save_summary_files(
+    df: pd.DataFrame,
+    training_results: Mapping[str, ClientTrainingResult],
+    bundle: EvaluationBundle,
+    config: ExperimentConfig,
+    output_dir: Path,
+) -> None:
+    summary = make_results_summary(df, training_results, bundle, config)
+    write_text(output_dir / "README_FedXAI_Health_results.md", summary)
+
+    metadata = {
+        "dataset_rows_after_cleaning": int(len(df)),
+        "feature_count": int(len(FEATURES)),
+        "features": FEATURES,
+        "target": TARGET,
+        "config": asdict(config),
+        "training": {
+            name: {
+                "train_seconds": result.train_seconds,
+                "n_train_samples": result.n_train_samples,
+            }
+            for name, result in training_results.items()
+        },
+        "metrics": bundle.metrics.round(6).to_dict(orient="index"),
+    }
+    write_json(output_dir / "experiment_metadata.json", metadata)
+
+
+def run_experiment(
+    data_path: Path,
+    output_dir: Path,
+    config: ExperimentConfig,
+) -> EvaluationBundle:
+    set_plot_style()
+    output_dir = ensure_dir(output_dir)
+    LOGGER.info("Writing outputs to %s", output_dir.resolve())
+
+    df = load_heart_data(data_path)
+    save_dataset_profile(df, output_dir)
+    generate_eda_figures(df, output_dir)
+
+    x_train, x_test, y_train, y_test = split_train_test(df, config)
+    clients = create_federated_clients(x_train, y_train, config)
+    save_client_profiles(clients, output_dir)
+
+    training_results = train_clients(clients, config)
+    bundle = evaluate_all_models(
+        training_results, x_test, y_test, config
+    )
+
+    save_metric_tables(bundle, output_dir)
+    generate_evaluation_figures(
+        bundle, training_results, y_test, output_dir
+    )
+    generate_shap_outputs(
+        training_results, x_train, x_test, config, output_dir
+    )
+    generate_lime_outputs(
+        training_results, x_train, x_test, config, output_dir
+    )
+    generate_xai_coverage_outputs(bundle, y_test, config, output_dir)
+
+    if config.save_models:
+        save_trained_models(training_results, output_dir)
+
+    save_summary_files(
+        df, training_results, bundle, config, output_dir
+    )
+    LOGGER.info("Experiment complete")
+    return bundle
+
+
+def fraction(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Value must be numeric.") from exc
+    if parsed <= 0 or parsed >= 1:
+        raise argparse.ArgumentTypeError(
+            "Value must be greater than 0 and less than 1."
+        )
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Value must be an integer."
+        ) from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "Value must be a positive integer."
+        )
+    return parsed
+
+
+def parse_coverage_values(
+    values: Optional[Sequence[str]],
+) -> Tuple[float, ...]:
+    if not values:
+        return (0.98, 1.00)
+    try:
+        parsed = tuple(float(value) for value in values)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Coverage values must be numeric."
+        ) from exc
+    if any(value <= 0 or value > 1 for value in parsed):
+        raise argparse.ArgumentTypeError(
+            "Coverage values must be in (0, 1]."
+        )
+    return parsed
+
+
+def parse_args(
+    argv: Optional[Sequence[str]] = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the FedXAI-Health federated learning and explainable AI "
+            "pipeline for secure medical analytics."
+        )
+    )
+    parser.add_argument(
+        "--data",
+        type=Path,
+        required=True,
+        help="Path to the heart.csv dataset.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("fedxai_health_outputs"),
+        help="Directory for figures, tables, models, and summaries.",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=fraction,
+        default=0.20,
+        help="Central test split fraction in (0, 1).",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=fraction,
+        default=0.50,
+        help="Positive-class decision threshold in (0, 1).",
+    )
+    parser.add_argument(
+        "--shap-background-size",
+        type=positive_int,
+        default=80,
+    )
+    parser.add_argument(
+        "--shap-sample-size",
+        type=positive_int,
+        default=120,
+    )
+    parser.add_argument(
+        "--shap-nsamples",
+        type=positive_int,
+        default=100,
+    )
+    parser.add_argument(
+        "--coverage",
+        nargs="*",
+        default=None,
+        help="For example: --coverage 0.98 1.0",
+    )
+    parser.add_argument("--skip-shap", action="store_true")
+    parser.add_argument("--skip-lime", action="store_true")
+    parser.add_argument("--no-save-models", action="store_true")
+    return parser.parse_args(argv)
+
+
+def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
+    return ExperimentConfig(
+        random_state=RANDOM_STATE,
+        test_size=args.test_size,
+        n_clients=3,
+        decision_threshold=args.threshold,
+        shap_background_size=args.shap_background_size,
+        shap_sample_size=args.shap_sample_size,
+        shap_nsamples=args.shap_nsamples,
+        lime_num_features=10,
+        xai_coverages=parse_coverage_values(args.coverage),
+        run_shap=not args.skip_shap,
+        run_lime=not args.skip_lime,
+        save_models=not args.no_save_models,
+    )
+
+
+def print_final_console_report(
+    bundle: EvaluationBundle,
+    output_dir: Path,
+) -> None:
+    print()
+    print("FedXAI-Health experiment complete.")
+    print(f"Outputs saved to: {output_dir.resolve()}")
+    print()
+    print("Metrics:")
+    print(bundle.metrics.round(3))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_logging()
+    args = parse_args(argv)
+    config = config_from_args(args)
+
+    try:
+        bundle = run_experiment(
+            data_path=args.data,
+            output_dir=args.output,
+            config=config,
+        )
+        print_final_console_report(bundle, args.output)
+        return 0
+    except Exception as exc:
+        LOGGER.exception("Experiment failed: %s", exc)
+        return 1
+
+
 if __name__ == "__main__":
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--output", default="fedxai_outputs")
-    args=ap.parse_args()
-    main(args.data,args.output)
+    raise SystemExit(main())
+    raise SystemExit(main())
